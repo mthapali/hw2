@@ -165,8 +165,9 @@ int main( int argc, char **argv )
     
     
         // GPU particle data structure
-    //particle_t * d_particles;
-    //cudaMalloc((void **) &d_particles, n * sizeof(particle_t));
+    particle_t * d_particles;
+    cudaMalloc((void **) &d_particles, n * sizeof(particle_t));
+    
     thrust::device_ptr<particle_t> particles_d_ptr = thrust::device_malloc<particle_t>(n);
     thrust::device_ptr<int> particle_IDs_ptr = thrust::device_malloc<int>(n);
     thrust::device_ptr<int> cts_ptr = thrust::device_malloc<int>(bins+1);
