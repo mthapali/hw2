@@ -4,18 +4,45 @@
 #include <math.h>
 #include <cuda.h>
 #include "common.h"
-#include <thrust/execution_policy.h>
-#include <thrust/copy.h>
-#include <thrust/scan.h>
-#include <thrust/host_vector.h>
-#include <thrust/device_vector.h>
 
 #define NUM_THREADS 256
+
+const double DIM = 2.0 * cutoff;
+
+int num, tot_num;
+double dim;
 
 extern double size;
 //
 //  benchmarking program
 //
+
+__device__ int locationToID(double x, double y, double dim, int num) {
+  int xID = x / dim;
+  int yID = y / dim;
+  return xID * num + yID; 
+}
+
+__device__ int locationToID(particle_t &particle, double dim, int num) {
+  int xID = particle.x / dim;
+  int yID = particle.y / dim;
+  return xID * num + yID; 
+}
+
+__global__ void assign_particles(int n, particle_t * particles, int* d_next, int* d_grids, double dim, int num) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if(tid >= n) return;
+  
+  int k = locationToID(particles[tid], dim, num);
+  d_next[tid] = atomicExch(&d_grids[k], tid);
+}
+
+__global__ void clear_grids(int tot_num, int* d_grids) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if(tid >= tot_num) return;
+  
+  d_grids[tid] = -1;
+}
 
 __device__ void apply_force_gpu(particle_t &particle, particle_t &neighbor)
 {
@@ -37,77 +64,102 @@ __device__ void apply_force_gpu(particle_t &particle, particle_t &neighbor)
 
 }
 
-//added 
-
-__global__ void compute_particle_IDs_gpu(particle_t* particles, int* particle_IDs, int n, int blockSize)
-{
-    // Get thread (particle) ID
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= n) return;
-    
-    int binY = floor(particles[tid].y / cutoff);
-    int binX = floor(particles[tid].x / cutoff);
-    particle_IDs[tid] = binY * blockSize + binX;
+__device__ void compute_self_grid_forces(int tid, particle_t * particles, int * d_next, int head) {
+  particle_t* p = &particles[tid];
+  for(int i = head; i != -1; i = d_next[i]) {
+    if(i != tid)
+      apply_force_gpu(*p, particles[i]);
+  }
 }
 
-//added
-__global__ void count_particles_gpu(int *particle_IDs, int *cts, int n)
-{
-    // Get thread (particle) ID
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= n) return;
-    atomicAdd(cts + particle_IDs[tid], 1);
+__device__ void compute_grid_forces(int tid, particle_t * particles, int * d_next, int head) {
+  particle_t* p = &particles[tid];
+  for(int i = head; i != -1; i = d_next[i]) {
+      apply_force_gpu(*p, particles[i]);
+  }
 }
 
-
-
-__global__ void compute_forces_gpu(particle_t * particles, int *cts, int blockSize, int bins)
+__global__ void compute_forces_gpu(int n, particle_t * particles, int * d_next, int * d_grids, double dim, int num)
 {
   // Get thread (particle) ID
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if(tid >= bins) return; 
+  if(tid >= n) return;
 
-  int blockIdxX = tid % blockSize;
-  int blockIdxY = tid / blockSize;
+  particle_t * p = &particles[tid];
+  int xID = p->x / dim;
+  int yID = p->y / dim;
+  int k = xID * num + yID;  
+  
+  p->ax = p->ay = 0;
+  
+  // check self
+  compute_self_grid_forces(tid, particles, d_next, d_grids[k]);
+  
+  // check other
+  if(xID > 0) {
+    compute_grid_forces(tid, particles, d_next, d_grids[k - num]);
+    if(yID > 0)
+      compute_grid_forces(tid, particles, d_next, d_grids[k - num - 1]);
+    if(yID < num - 1)
+      compute_grid_forces(tid, particles, d_next, d_grids[k - num + 1]);
+  }
+  if(xID < num - 1) {
+    compute_grid_forces(tid, particles, d_next, d_grids[k + num]);
+    if(yID > 0)
+      compute_grid_forces(tid, particles, d_next, d_grids[k + num - 1]);
+    if(yID < num - 1)
+      compute_grid_forces(tid, particles, d_next, d_grids[k + num + 1]);
+  }
+  if(yID > 0) compute_grid_forces(tid, particles, d_next, d_grids[k - 1]);
+  if(yID < num - 1) compute_grid_forces(tid, particles, d_next, d_grids[k + 1]);
+}
 
-  for (int idx = cts[tid]; idx < cts[tid+1]; ++idx)
-    {
-        particle_t &p = particles[idx];
-        p.ax = p.ay = 0;
+__global__ void compute_grid_forces_gpu(particle_t * particles, int * d_next,int tot_num, int * d_grids, double dim, int num)
+{
+  // Get thread (particle) ID
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if(tid >= tot_num) return;
+
+  int xID = tid / num;
+  int yID = tid % num;
+  int k = tid;
+
+  for(int i = d_grids[tid]; i != -1; i = d_next[i]) {
+    particle_t * p = &particles[i];
+
+    p->ax = p->ay = 0;
+  
+    // check self
+    compute_self_grid_forces(i, particles, d_next, d_grids[k]);
+  
+    // check other
+    if(xID > 0) {
+      compute_grid_forces(i, particles, d_next, d_grids[k - num]);
+      if(yID > 0)
+        compute_grid_forces(i, particles, d_next, d_grids[k - num - 1]);
+      if(yID < num - 1)
+        compute_grid_forces(i, particles, d_next, d_grids[k - num + 1]);
     }
-
-    //load target, neighbor particles into scratch space
-
-  for (int neighborY = max(blockIdxY - 1, 0); neighborY <= min(blockIdxY + 1, blockSize - 1); ++neighborY)
-    {
-        int neighborBinStart = neighborY * blockSize + max(blockIdxX - 1, 0);
-        int neighborBinEnd = neighborY * blockSize + min(blockIdxX + 1, blockSize - 1);
-        for (int neighborIdx = cts[neighborBinStart]; neighborIdx < cts[neighborBinEnd+1]; ++neighborIdx)
-        {
-            particle_t &neighbor = particles[neighborIdx];
-            for (int targetIdx = cts[tid]; targetIdx < cts[tid+1]; ++targetIdx)
-            {
-                particle_t &target = particles[targetIdx];
-                apply_force_gpu(target, neighbor);
-            }
-        }
+    if(xID < num - 1) {
+      compute_grid_forces(i, particles, d_next, d_grids[k + num]);
+      if(yID > 0)
+        compute_grid_forces(i, particles, d_next, d_grids[k + num - 1]);
+      if(yID < num - 1)
+        compute_grid_forces(i, particles, d_next, d_grids[k + num + 1]);
     }
-
-  /*  
-  particles[tid].ax = particles[tid].ay = 0;
-  for(int j = 0 ; j < n ; j++)
-    apply_force_gpu(particles[tid], particles[j]);
-    */
+    if(yID > 0) compute_grid_forces(i, particles, d_next, d_grids[k - 1]);
+    if(yID < num - 1) compute_grid_forces(i, particles, d_next, d_grids[k + 1]);
+  }
 }
 
 __global__ void move_gpu (particle_t * particles, int n, double size)
 {
 
   // Get thread (particle) ID
-  int idx = threadIdx.x + blockIdx.x * blockDim.x;
-  if(idx >= n) return;
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if(tid >= n) return;
 
-  particle_t * p = &particles[idx];
+  particle_t * p = &particles[tid];
     //
     //  slightly simplified Velocity Verlet integration
     //  conserves energy better than explicit Euler method
@@ -130,9 +182,8 @@ __global__ void move_gpu (particle_t * particles, int n, double size)
         p->y  = p->y < 0 ? -(p->y) : 2*size-p->y;
         p->vy = -(p->vy);
     }
+
 }
-
-
 
 int main( int argc, char **argv )
 {    
@@ -155,43 +206,50 @@ int main( int argc, char **argv )
     FILE *fsave = savename ? fopen( savename, "w" ) : NULL;
     particle_t *particles = (particle_t*) malloc( n * sizeof(particle_t) );
 
-    set_size( n );
-
-    init_particles( n, particles );
-
-    int blockSize = (size / cutoff) + 1;
-    int bins = blockSize * blockSize;
-    int blks_bin = (bins + NUM_THREADS - 1) / NUM_THREADS;
-    int blks_n = (n + NUM_THREADS - 1) / NUM_THREADS;
-    
-    
-        // GPU particle data structure
+    // GPU particle data structure
     particle_t * d_particles;
     cudaMalloc((void **) &d_particles, n * sizeof(particle_t));
 
-    thrust::device_ptr<particle_t> particles_d_ptr = thrust::device_malloc<particle_t>(n);
-    thrust::device_ptr<int> particle_IDs_ptr = thrust::device_malloc<int>(n);
-    thrust::device_ptr<int> cts_ptr = thrust::device_malloc<int>(bins+1);
-    particle_t *particles_d = thrust::raw_pointer_cast(particles_d_ptr);
-    int *particle_IDs = thrust::raw_pointer_cast(particle_IDs_ptr);
-    int *cts = thrust::raw_pointer_cast(cts_ptr);
+    set_size( n );
+
+    init_particles( n, particles );
 
     cudaThreadSynchronize();
     double copy_time = read_timer( );
 
     // Copy the particles to the GPU
     cudaMemcpy(d_particles, particles, n * sizeof(particle_t), cudaMemcpyHostToDevice);
-    // Bin particles by sorting
-    compute_particle_IDs_gpu <<< blks_n, NUM_THREADS >>> (particles_d, particle_IDs, n, blockSize);
-    thrust::sort_by_key(particle_IDs_ptr, particle_IDs_ptr + n, particles_d_ptr);
-    // Compute bin boundaries
-    thrust::fill(cts_ptr, cts_ptr + bins + 1, 0);
-    count_particles_gpu <<< blks_n, NUM_THREADS >>> (particle_IDs, cts, n);
-    thrust::exclusive_scan(cts_ptr, cts_ptr + bins + 1, cts_ptr);
-
 
     cudaThreadSynchronize();
     copy_time = read_timer( ) - copy_time;
+    
+    
+    // set up grids
+    double set_grid_time = read_timer();
+    
+    num = (int)ceil(size*1.0 / DIM); // we get the num of the grid for one directions
+    tot_num = num * num; // total number of grids
+    dim = size/num; // the acutal size of a subgrid
+    
+    int blks = (n + NUM_THREADS - 1) / NUM_THREADS;
+    int g_blks = (tot_num + NUM_THREADS - 1) / NUM_THREADS;
+    
+    
+    int * d_grids;
+    cudaMalloc((void **) &d_grids, tot_num * sizeof(int));
+    int * d_next;
+    cudaMalloc((void **) &d_next, n * sizeof(int));
+    
+    cudaThreadSynchronize();
+    
+  clear_grids <<< g_blks, NUM_THREADS >>> (tot_num, d_grids);
+    
+  assign_particles <<< blks, NUM_THREADS >>> (n, d_particles, d_next, d_grids, dim, num);
+  
+    cudaThreadSynchronize();
+    
+    set_grid_time = read_timer() - set_grid_time;
+    
     
     //
     //  simulate a number of time steps
@@ -205,40 +263,41 @@ int main( int argc, char **argv )
         //  compute forces
         //
 
-	int blks = (n + NUM_THREADS - 1) / NUM_THREADS;
-	compute_forces_gpu <<< blks, NUM_THREADS >>> (d_particles, cts, blockSize, bins);
+  
+  compute_forces_gpu <<< blks, NUM_THREADS >>> (n, d_particles, d_next, d_grids, dim, num);
+  //compute_grid_forces_gpu <<< g_blks, NUM_THREADS >>> (d_particles, d_next, tot_num, d_grids, dim, num);
         
         //
         //  move particles
         //
-	move_gpu <<< blks, NUM_THREADS >>> (d_particles, n, size);
-
-  // Re-bin particles by sorting
-  compute_particle_IDs_gpu <<< blks_n, NUM_THREADS >>> (particles_d, particle_IDs, n, blockSize);
-  thrust::sort_by_key(particle_IDs_ptr, particle_IDs_ptr + n, particles_d_ptr);
-  // Compute bin boundaries
-  thrust::fill(cts_ptr, cts_ptr + bins + 1, 0);
-  count_particles_gpu <<< blks_n, NUM_THREADS >>> (particle_IDs, cts, n);
-  thrust::exclusive_scan(cts_ptr, cts_ptr + bins + 1, cts_ptr);
+  move_gpu <<< blks, NUM_THREADS >>> (d_particles, n, size);
+        
+       
+   // Re-locate all the particles to grids
+   
+   clear_grids <<< g_blks, NUM_THREADS >>> (tot_num, d_grids);
+   assign_particles <<< blks, NUM_THREADS >>> (n, d_particles, d_next, d_grids, dim, num);    
+        
         //
         //  save if necessary
         //
-  if( fsave && (step%SAVEFREQ) == 0 ) {
-	    // Copy the particles back to the CPU
-      cudaMemcpy(particles, d_particles, n * sizeof(particle_t), cudaMemcpyDeviceToHost);
-      save( fsave, n, particles);
-	     }
+        if( fsave && (step%SAVEFREQ) == 0 ) {
+      // Copy the particles back to the CPU
+            cudaMemcpy(particles, d_particles, n * sizeof(particle_t), cudaMemcpyDeviceToHost);
+            save( fsave, n, particles);
+  }
     }
     cudaThreadSynchronize();
     simulation_time = read_timer( ) - simulation_time;
     
     printf( "CPU-GPU copy time = %g seconds\n", copy_time);
+    printf( "GPU init grids time = %g seconds\n", set_grid_time);
     printf( "n = %d, simulation time = %g seconds\n", n, simulation_time );
     
     free( particles );
-    thrust::device_free(particles_d_ptr);
-    thrust::device_free(particle_IDs_ptr);
-    thrust::device_free(cts_ptr);
+    cudaFree(d_particles);
+    cudaFree(d_grids);
+    cudaFree(d_next);
     if( fsave )
         fclose( fsave );
     
