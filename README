@@ -1,0 +1,2 @@
+In order to use cuda you must first load the cuda module by running:
+'module load cuda'
