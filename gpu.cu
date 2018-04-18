@@ -60,11 +60,11 @@ __global__ void count_particles_gpu(int *particle_IDs, int *cts, int n)
 
 
 
-__global__ void compute_forces_gpu(particle_t * particles, int *cts, int blockSize, int n)
+__global__ void compute_forces_gpu(particle_t * particles, int *cts, int blockSize, int bins)
 {
   // Get thread (particle) ID
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if(tid >= n) || (cts[tid] == cts[tid+1])) return; 
+  if(tid >= bins) return; 
 
   int blockIdxX = tid % blockSize;
   int blockIdxY = tid / blockSize;
@@ -159,8 +159,8 @@ int main( int argc, char **argv )
     init_particles( n, particles );
 
     int blockSize = (size / cutoff) + 1;
-    int n = blockSize * blockSize;
-    int blks_bin = (n + NUM_THREADS - 1) / NUM_THREADS;
+    int bins = blockSize * blockSize;
+    int blks_bin = (bins + NUM_THREADS - 1) / NUM_THREADS;
     int blks_n = (n + NUM_THREADS - 1) / NUM_THREADS;
     
     
@@ -169,7 +169,7 @@ int main( int argc, char **argv )
     //cudaMalloc((void **) &d_particles, n * sizeof(particle_t));
     thrust::device_ptr<particle_t> particles_d_ptr = thrust::device_malloc<particle_t>(n);
     thrust::device_ptr<int> particle_IDs_ptr = thrust::device_malloc<int>(n);
-    thrust::device_ptr<int> cts_ptr = thrust::device_malloc<int>(n+1);
+    thrust::device_ptr<int> cts_ptr = thrust::device_malloc<int>(bins+1);
     particle_t *particles_d = thrust::raw_pointer_cast(particles_d_ptr);
     int *particle_IDs = thrust::raw_pointer_cast(particle_IDs_ptr);
     int *cts = thrust::raw_pointer_cast(cts_ptr);
@@ -183,9 +183,9 @@ int main( int argc, char **argv )
     compute_particle_IDs_gpu <<< blks_n, NUM_THREADS >>> (particles_d, particle_IDs, n, blockSize);
     thrust::sort_by_key(particle_IDs_ptr, particle_IDs_ptr + n, particles_d_ptr);
     // Compute bin boundaries
-    thrust::fill(cts_ptr, cts_ptr + n + 1, 0);
+    thrust::fill(cts_ptr, cts_ptr + bins + 1, 0);
     count_particles_gpu <<< blks_n, NUM_THREADS >>> (particle_IDs, cts, n);
-    thrust::exclusive_scan(cts_ptr, cts_ptr + n + 1, cts_ptr);
+    thrust::exclusive_scan(cts_ptr, cts_ptr + bins + 1, cts_ptr);
 
 
     cudaThreadSynchronize();
@@ -204,7 +204,7 @@ int main( int argc, char **argv )
         //
 
 	int blks = (n + NUM_THREADS - 1) / NUM_THREADS;
-	compute_forces_gpu <<< blks, NUM_THREADS >>> (d_particles, cts, blockSize, n);
+	compute_forces_gpu <<< blks, NUM_THREADS >>> (d_particles, cts, blockSize, bins);
         
         //
         //  move particles
@@ -215,9 +215,9 @@ int main( int argc, char **argv )
   compute_particle_IDs_gpu <<< blks_n, NUM_THREADS >>> (particles_d, particle_IDs, n, blockSize);
   thrust::sort_by_key(particle_IDs_ptr, particle_IDs_ptr + n, particles_d_ptr);
   // Compute bin boundaries
-  thrust::fill(cts_ptr, cts_ptr + n + 1, 0);
+  thrust::fill(cts_ptr, cts_ptr + bins + 1, 0);
   count_particles_gpu <<< blks_n, NUM_THREADS >>> (particle_IDs, cts, n);
-  thrust::exclusive_scan(cts_ptr, cts_ptr + n + 1, cts_ptr);
+  thrust::exclusive_scan(cts_ptr, cts_ptr + bins + 1, cts_ptr);
         //
         //  save if necessary
         //
